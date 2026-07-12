@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>curl-noise-8k — 8192 particles, 3D curl noise (GPGPU)</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#000; color:#ddd; font-family: -apple-system, "Helvetica Neue", sans-serif; overflow:hidden; }
+  body { display:flex; justify-content:center; align-items:center; }
+  #c { display:block; background:#000; }
+  #hud {
+    position:fixed; left:12px; top:10px; font-size:11px; line-height:1.5;
+    background:rgba(0,0,0,0.45); padding:8px 10px; border-radius:6px;
+    pointer-events:none; user-select:none; letter-spacing:0.02em;
+  }
+  #hud b { color:#9cf; font-weight:600; }
+  #hud kbd { background:#222; padding:1px 5px; border-radius:3px; border:1px solid #333; }
+  #hud .row { margin-top:6px; pointer-events:auto; display:flex; align-items:center; gap:6px; }
+  #hud input[type=range] { width:140px; }
+  #hud .val { color:#9cf; width:34px; display:inline-block; text-align:right; }
+  #status { position:fixed; right:12px; top:10px; font-size:11px; background:rgba(0,0,0,0.5); padding:6px 10px; border-radius:6px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>curl-noise-8k</b> &nbsp; 1,048,576 particles, GPGPU<br>
+  drag: orbit / wheel: zoom<br>
+  <kbd>space</kbd> pause &nbsp; <kbd>a</kbd> auto-rotate &nbsp; <kbd>n</kbd> reseed<br>
+  <kbd>r</kbd> render 8K PNG sequence &nbsp; <kbd>h</kbd> hide UI
+  <div class="row">size &nbsp;<input id="sizeSlider"  type="range" min="1.0" max="12.0" step="0.5"  value="1.0"><span class="val" id="sizeVal">1.0</span></div>
+  <div class="row">brt &nbsp;&nbsp;<input id="brtSlider"   type="range" min="0.1" max="8.0"  step="0.05" value="1.0"><span class="val" id="brtVal">1.00</span></div>
+  <div class="row">dens <input id="densSlider"  type="range" min="0.02" max="1.0" step="0.01" value="1.0"><span class="val" id="densVal">1.00</span></div>
+  <div class="row">scl &nbsp;&nbsp;<input id="sclSlider"   type="range" min="0.1" max="2.5"  step="0.01" value="0.55"><span class="val" id="sclVal">0.55</span></div>
+  <div class="row">spd &nbsp;&nbsp;<input id="spdSlider"   type="range" min="0.1" max="4.0"  step="0.05" value="1.4"><span class="val" id="spdVal">1.40</span></div>
+  <div class="row">blur <input id="blurSlider"  type="range" min="0.0" max="2.5"  step="0.02" value="0.0"><span class="val" id="blurVal">0.00</span></div>
+  <div class="row">rad &nbsp;&nbsp;<input id="radSlider"   type="range" min="0.0" max="1.5"  step="0.01" value="0.0"><span class="val" id="radVal">0.00</span></div>
+</div>
+<div id="status">init…</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://esm.sh/three@0.160.0",
+    "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+const PARTICLE_W = 1024;
+const PARTICLE_H = 1024;
+const PARTICLE_COUNT = PARTICLE_W * PARTICLE_H; // 1,048,576
+
+const statusEl = document.getElementById('status');
+const setStatus = (s) => { statusEl.textContent = s; };
+
+// ---------- Renderer / Scene / Camera ----------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x000000, 0.05);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 200);
+camera.position.set(4.2, 2.6, 5.4);
+
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.autoRotate = false;
+controls.autoRotateSpeed = 0.4;
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.0, 0.0, 0.0); // strength, radius, threshold
+bloomPass.enabled = false;
+composer.addPass(bloomPass);
+
+// Always render at 8K internally; CSS letterboxes the canvas to the window.
+const RENDER_W = 7680, RENDER_H = 4320;
+renderer.setPixelRatio(1);
+renderer.setSize(RENDER_W, RENDER_H, false);
+composer.setSize(RENDER_W, RENDER_H);
+bloomPass.setSize(RENDER_W, RENDER_H);
+camera.aspect = RENDER_W / RENDER_H;
+camera.updateProjectionMatrix();
+
+function applyCssFit() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const a = RENDER_W / RENDER_H;
+  let cw, ch;
+  if (w / h > a) { ch = h; cw = h * a; } else { cw = w; ch = w / a; }
+  canvas.style.width  = cw + 'px';
+  canvas.style.height = ch + 'px';
+}
+window.addEventListener('resize', applyCssFit);
+applyCssFit();
+
+// ---------- GPGPU ----------
+const gpu = new GPUComputationRenderer(PARTICLE_W, PARTICLE_H, renderer);
+const dtPos = gpu.createTexture();
+const dtVel = gpu.createTexture();
+
+function seedTextures() {
+  const posArr = dtPos.image.data;
+  const velArr = dtVel.image.data;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const k = i * 4;
+    // Initial cloud: gaussian-ish ball
+    const r = Math.cbrt(Math.random()) * 1.4;
+    const t = Math.random() * Math.PI * 2;
+    const u = Math.random() * 2 - 1;
+    const s = Math.sqrt(1 - u * u);
+    posArr[k + 0] = r * s * Math.cos(t);
+    posArr[k + 1] = r * s * Math.sin(t);
+    posArr[k + 2] = r * u;
+    posArr[k + 3] = Math.random();             // life seed
+    velArr[k + 0] = 0;
+    velArr[k + 1] = 0;
+    velArr[k + 2] = 0;
+    velArr[k + 3] = 0;
+  }
+  dtPos.needsUpdate = true;
+  dtVel.needsUpdate = true;
+}
+seedTextures();
+
+// --- Common GLSL: 3D simplex + curl noise -------------------------------
+const NOISE_GLSL = /* glsl */`
+// Ashima 3D simplex noise (https://github.com/ashima/webgl-noise) — MIT
+vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 mod289(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g  = step(x0.yzx, x0.xyz);
+  vec3 l  = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+            i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3  ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m*m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+// Vector noise via 3 offset samples → potential field
+vec3 snoiseVec3(vec3 x){
+  float s  = snoise(x);
+  float s1 = snoise(vec3(x.y - 19.1, x.z + 33.4, x.x + 47.2));
+  float s2 = snoise(vec3(x.z + 74.2, x.x - 124.5, x.y + 99.4));
+  return vec3(s, s1, s2);
+}
+
+// Bridson-style divergence-free curl of vector noise
+vec3 curlNoise(vec3 p){
+  const float e = 0.1;
+  vec3 dx = vec3(e, 0.0, 0.0);
+  vec3 dy = vec3(0.0, e, 0.0);
+  vec3 dz = vec3(0.0, 0.0, e);
+  vec3 p_x0 = snoiseVec3(p - dx);
+  vec3 p_x1 = snoiseVec3(p + dx);
+  vec3 p_y0 = snoiseVec3(p - dy);
+  vec3 p_y1 = snoiseVec3(p + dy);
+  vec3 p_z0 = snoiseVec3(p - dz);
+  vec3 p_z1 = snoiseVec3(p + dz);
+  float x = p_y1.z - p_y0.z - p_z1.y + p_z0.y;
+  float y = p_z1.x - p_z0.x - p_x1.z + p_x0.z;
+  float z = p_x1.y - p_x0.y - p_y1.x + p_y0.x;
+  return vec3(x, y, z) / (2.0 * e);
+}
+`;
+
+// --- Velocity update shader ---------------------------------------------
+const velShader = /* glsl */`
+uniform float uTime;
+uniform float uDt;
+uniform float uNoiseScale;
+uniform float uFlowSpeed;
+uniform float uDamping;
+
+${NOISE_GLSL}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / resolution.xy;
+  vec4 pos = texture2D(texturePosition, uv);
+  vec4 vel = texture2D(textureVelocity, uv);
+
+  // Slowly-evolving curl noise field
+  vec3 q = pos.xyz * uNoiseScale + vec3(0.0, 0.0, uTime * 0.05);
+  vec3 flow = curlNoise(q) * uFlowSpeed;
+
+  // Blend toward flow (lagrangian particle in viscous fluid) + soft damping
+  vec3 newVel = mix(vel.xyz, flow, 0.25) * uDamping;
+
+  // Gentle radial pull toward origin so particles don't escape forever
+  newVel += -pos.xyz * 0.04 * uDt;
+
+  gl_FragColor = vec4(newVel, vel.w);
+}
+`;
+
+// --- Position update shader ---------------------------------------------
+const posShader = /* glsl */`
+uniform float uDt;
+uniform float uTime;
+uniform float uReseed;
+
+${NOISE_GLSL}
+
+// hash-based random
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / resolution.xy;
+  vec4 pos = texture2D(texturePosition, uv);
+  vec4 vel = texture2D(textureVelocity, uv);
+
+  vec3 p = pos.xyz + vel.xyz * uDt;
+
+  // Age, with per-particle phase so they reseed at staggered times
+  float life = pos.w + uDt * (0.06 + 0.05 * hash(uv * 13.7));
+  if (uReseed > 0.5 || life > 1.0 || length(p) > 6.0) {
+    // Respawn somewhere in a sphere
+    float t  = hash(uv + uTime) * 6.2831853;
+    float u  = hash(uv * 7.13 + uTime) * 2.0 - 1.0;
+    float r  = pow(hash(uv * 3.71 + uTime), 0.333) * 1.4;
+    float s  = sqrt(1.0 - u*u);
+    p = vec3(r * s * cos(t), r * s * sin(t), r * u);
+    life = 0.0;
+  }
+
+  gl_FragColor = vec4(p, life);
+}
+`;
+
+const velVar = gpu.addVariable('textureVelocity', velShader, dtVel);
+const posVar = gpu.addVariable('texturePosition', posShader, dtPos);
+gpu.setVariableDependencies(velVar, [posVar, velVar]);
+gpu.setVariableDependencies(posVar, [posVar, velVar]);
+
+velVar.material.uniforms.uTime       = { value: 0 };
+velVar.material.uniforms.uDt         = { value: 0.016 };
+velVar.material.uniforms.uNoiseScale = { value: 0.55 };
+velVar.material.uniforms.uFlowSpeed  = { value: 1.4 };
+velVar.material.uniforms.uDamping    = { value: 0.985 };
+
+posVar.material.uniforms.uTime   = { value: 0 };
+posVar.material.uniforms.uDt     = { value: 0.016 };
+posVar.material.uniforms.uReseed = { value: 0 };
+
+// linear sampling on the FBO targets is fine
+velVar.wrapS = velVar.wrapT = THREE.ClampToEdgeWrapping;
+posVar.wrapS = posVar.wrapT = THREE.ClampToEdgeWrapping;
+
+const initErr = gpu.init();
+if (initErr) {
+  setStatus('GPGPU init error: ' + initErr);
+  console.error(initErr);
+}
+
+// ---------- Points rendering ----------
+const geom = new THREE.BufferGeometry();
+{
+  const positions = new Float32Array(PARTICLE_COUNT * 3);   // placeholder; ignored in VS
+  const uvs       = new Float32Array(PARTICLE_COUNT * 2);
+  for (let j = 0; j < PARTICLE_H; j++) {
+    for (let i = 0; i < PARTICLE_W; i++) {
+      const idx = j * PARTICLE_W + i;
+      uvs[idx * 2 + 0] = (i + 0.5) / PARTICLE_W;
+      uvs[idx * 2 + 1] = (j + 0.5) / PARTICLE_H;
+    }
+  }
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geom.setAttribute('uvRef',    new THREE.BufferAttribute(uvs, 2));
+}
+
+const pointsMat = new THREE.ShaderMaterial({
+  uniforms: {
+    texturePosition: { value: null },
+    textureVelocity: { value: null },
+    uSize:           { value: 1.0 },
+    uBrightness:     { value: 1.0 },
+    uDensity:        { value: 1.0 },
+    uColorA:         { value: new THREE.Color(0x66c8ff) },
+    uColorB:         { value: new THREE.Color(0xffb070) },
+    uColorC:         { value: new THREE.Color(0xff3060) },
+  },
+  vertexShader: /* glsl */`
+    uniform sampler2D texturePosition;
+    uniform sampler2D textureVelocity;
+    uniform float uSize;
+    uniform float uDensity;
+    attribute vec2 uvRef;
+    varying float vSpeed;
+    varying float vLife;
+    void main() {
+      // per-particle deterministic hash → keep only fraction uDensity visible
+      float h = fract(sin(dot(uvRef, vec2(127.1, 311.7))) * 43758.5453);
+      if (h > uDensity) {
+        gl_Position  = vec4(2.0, 2.0, 2.0, 1.0); // clip out
+        gl_PointSize = 0.0;
+        vSpeed = 0.0; vLife = 0.0;
+        return;
+      }
+      vec4 p = texture2D(texturePosition, uvRef);
+      vec4 v = texture2D(textureVelocity, uvRef);
+      vSpeed = length(v.xyz);
+      vLife  = p.w;
+      vec4 mv = modelViewMatrix * vec4(p.xyz, 1.0);
+      gl_Position  = projectionMatrix * mv;
+      gl_PointSize = uSize;       // exact pixel size on the 8K framebuffer
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3  uColorA;
+    uniform vec3  uColorB;
+    uniform vec3  uColorC;
+    uniform float uBrightness;
+    varying float vSpeed;
+    varying float vLife;
+    void main() {
+      vec2 d = gl_PointCoord - 0.5;
+      float r = dot(d, d) * 4.0;
+      if (r > 1.0) discard;
+      float a = pow(1.0 - r, 2.2);
+      float s = clamp(vSpeed * 0.5, 0.0, 1.0);
+      vec3 col = mix(uColorA, uColorB, s);
+      col      = mix(col, uColorC, smoothstep(0.7, 1.0, s));
+      // life-based fade in/out
+      float lifeFade = smoothstep(0.0, 0.08, vLife) * (1.0 - smoothstep(0.85, 1.0, vLife));
+      gl_FragColor = vec4(col * (0.5 + 0.7 * s) * uBrightness, a * lifeFade * 0.95);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+});
+
+const points = new THREE.Points(geom, pointsMat);
+points.frustumCulled = false;
+scene.add(points);
+
+// ---------- State / controls ----------
+const state = {
+  paused: false,
+  rendering: false,
+  reseedPulse: 0,
+};
+
+const hud = document.getElementById('hud');
+window.addEventListener('keydown', (e) => {
+  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+  if (e.code === 'Space')      { state.paused = !state.paused; }
+  else if (e.key === 'a')      { controls.autoRotate = !controls.autoRotate; }
+  else if (e.key === 'n')      { state.reseedPulse = 1; }
+  else if (e.key === 'r')      { startRender8K(); }
+  else if (e.key === 'h')      {
+    const hidden = hud.style.display === 'none';
+    hud.style.display    = hidden ? '' : 'none';
+    statusEl.style.display = hidden ? '' : 'none';
+  }
+});
+
+const sizeSlider = document.getElementById('sizeSlider');
+const sizeVal    = document.getElementById('sizeVal');
+sizeSlider.addEventListener('input', () => {
+  const v = parseFloat(sizeSlider.value);
+  pointsMat.uniforms.uSize.value = v;
+  sizeVal.textContent = v.toFixed(2);
+});
+
+const brtSlider = document.getElementById('brtSlider');
+const brtVal    = document.getElementById('brtVal');
+brtSlider.addEventListener('input', () => {
+  const v = parseFloat(brtSlider.value);
+  pointsMat.uniforms.uBrightness.value = v;
+  brtVal.textContent = v.toFixed(2);
+});
+
+const densSlider = document.getElementById('densSlider');
+const densVal    = document.getElementById('densVal');
+densSlider.addEventListener('input', () => {
+  const v = parseFloat(densSlider.value);
+  pointsMat.uniforms.uDensity.value = v;
+  densVal.textContent = v.toFixed(2);
+});
+
+const sclSlider = document.getElementById('sclSlider');
+const sclVal    = document.getElementById('sclVal');
+sclSlider.addEventListener('input', () => {
+  const v = parseFloat(sclSlider.value);
+  velVar.material.uniforms.uNoiseScale.value = v;
+  sclVal.textContent = v.toFixed(2);
+});
+
+const spdSlider = document.getElementById('spdSlider');
+const spdVal    = document.getElementById('spdVal');
+spdSlider.addEventListener('input', () => {
+  const v = parseFloat(spdSlider.value);
+  velVar.material.uniforms.uFlowSpeed.value = v;
+  spdVal.textContent = v.toFixed(2);
+});
+
+const blurSlider = document.getElementById('blurSlider');
+const blurVal    = document.getElementById('blurVal');
+blurSlider.addEventListener('input', () => {
+  const v = parseFloat(blurSlider.value);
+  bloomPass.strength = v;
+  bloomPass.enabled  = v > 0.0001 || bloomPass.radius > 0.0001;
+  blurVal.textContent = v.toFixed(2);
+});
+
+const radSlider = document.getElementById('radSlider');
+const radVal    = document.getElementById('radVal');
+radSlider.addEventListener('input', () => {
+  const v = parseFloat(radSlider.value);
+  bloomPass.radius = v;
+  bloomPass.enabled  = v > 0.0001 || bloomPass.strength > 0.0001;
+  radVal.textContent = v.toFixed(2);
+});
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+let lastT = 0;
+let frameCount = 0;
+
+function stepSim(dt, t) {
+  velVar.material.uniforms.uTime.value = t;
+  velVar.material.uniforms.uDt.value   = dt;
+  posVar.material.uniforms.uTime.value = t;
+  posVar.material.uniforms.uDt.value   = dt;
+  posVar.material.uniforms.uReseed.value = state.reseedPulse;
+  if (state.reseedPulse > 0) state.reseedPulse = 0;
+
+  gpu.compute();
+
+  pointsMat.uniforms.texturePosition.value = gpu.getCurrentRenderTarget(posVar).texture;
+  pointsMat.uniforms.textureVelocity.value = gpu.getCurrentRenderTarget(velVar).texture;
+}
+
+function render() {
+  composer.render();
+}
+
+function loop() {
+  if (!state.rendering) requestAnimationFrame(loop);
+  const t  = clock.getElapsedTime();
+  const dt = Math.min(0.05, t - lastT);
+  lastT = t;
+
+  controls.update();
+
+  if (!state.paused) stepSim(dt, t);
+
+  render();
+
+  frameCount++;
+  if ((frameCount & 31) === 0) {
+    setStatus(`${PARTICLE_COUNT} particles · ${(1/Math.max(dt,1e-6)).toFixed(0)} fps · t=${t.toFixed(1)}s${state.paused ? ' · paused':''}`);
+  }
+}
+loop();
+
+// ---------- 8K PNG sequence export ----------
+async function startRender8K() {
+  if (state.rendering) return;
+  if (!window.showDirectoryPicker) {
+    setStatus('PNG出力には Chrome / Edge が必要 (File System Access API)');
+    return;
+  }
+  let dirHandle;
+  try {
+    dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+  } catch (e) {
+    setStatus('cancelled');
+    return;
+  }
+  const totalFrames = 600;          // 10s @ 60fps
+  const fixedDt     = 1 / 60;
+
+  state.rendering = true;
+  state.paused = false;
+  controls.autoRotate = true;
+
+  // Canvas is already at 8K; nothing to resize.
+  const tStart = performance.now();
+  for (let i = 0; i < totalFrames; i++) {
+    const t = i * fixedDt;
+    velVar.material.uniforms.uTime.value = t;
+    velVar.material.uniforms.uDt.value   = fixedDt;
+    posVar.material.uniforms.uTime.value = t;
+    posVar.material.uniforms.uDt.value   = fixedDt;
+    posVar.material.uniforms.uReseed.value = 0;
+    gpu.compute();
+    pointsMat.uniforms.texturePosition.value = gpu.getCurrentRenderTarget(posVar).texture;
+    pointsMat.uniforms.textureVelocity.value = gpu.getCurrentRenderTarget(velVar).texture;
+    controls.update();
+    composer.render();
+
+    const blob = await new Promise(res => renderer.domElement.toBlob(res, 'image/png'));
+    const fh   = await dirHandle.getFileHandle(`frame_${String(i).padStart(5,'0')}.png`, { create: true });
+    const w    = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+
+    const elapsed = (performance.now() - tStart) / 1000;
+    setStatus(`render 8K ${i+1}/${totalFrames} · ${(elapsed/(i+1)).toFixed(2)}s/frame`);
+    // yield
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  setStatus(`done · ${totalFrames} frames`);
+  state.rendering = false;
+  requestAnimationFrame(loop);
+}
+
+setStatus(`${PARTICLE_COUNT} particles · ready`);
+</script>
+</body>
+</html>
